@@ -959,7 +959,7 @@ def init_prepare(args):
 
     if args.resume is None:
         args.name = args.name.replace('_', '-')
-        run_label = f'trans5_{args.name}_{args.type},m{args.msg_len},s{args.strength:.1f}_{time.strftime("%m%d-%H%M%S")}'
+        run_label = f'{args.name}_{args.type},m{args.msg_len},s{args.strength:.1f}_{time.strftime("%m%d-%H%M%S")}'
     else:
         run_label = args.resume.split('/')[-1]
     args.this_run_folder = os.path.join(args.run_folder, run_label)
@@ -984,7 +984,7 @@ if __name__ == "__main__":
     parser.add_argument('--noise', dest='dispatch', action='store_const', const=exec_noise, help='')
     parser.add_argument('--var', dest='dispatch', action='store_const', const=exec_variety, help='')
     parser.add_argument('--disable_gpu', action='store_true', help='flag whether to disable GPU')
-    parser.add_argument('--name', type=str, default='', required=False, help='name the training')
+    parser.add_argument('--name', type=str, default='default', required=False, help='name the training')
     parser.add_argument('--msg_len', '-m', default=WM_MESSAGE_LENGTH, type=int, help='The length in bits of the watermark.')
     parser.add_argument('--wm_dim', default=32, type=int, help='')
     parser.add_argument('--strength', type=float, default=0.6, help='')

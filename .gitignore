@@ -1,5 +1,7 @@
 # Python-generated files
+.ipynb_checkpoints/
 __pycache__/
+logger/
 *.py[oc]
 build/
 dist/
