@@ -45,77 +45,6 @@ def calculate_psnr(img1, img2):
         return float('inf')
     return (10 * torch.log10(1.0 / mse)).item()
 
-def patchify(x, patch_size=16):
-    # x shape: [B, C, H, W] -> e.g., [1, 3, 256, 256]
-    b, c, h, w = x.shape
-    dim = patch_size * patch_size
-    p = patch_size
-
-    # 1. Break into patches
-    # We move the patch dimensions into the batch/channel dims to process in parallel
-    # Resulting shape: [B, C, H//p, p, W//p, p]
-    x = x.view(b, c, h // p, p, w // p, p)
-    
-    # 2. Reshape to (-1, 64) 
-    # Move H//p and W//p together, and p*p into the last dimension
-    # Shape: [B * C * (H//p) * (W//p), p*p]
-    x = x.permute(0, 1, 2, 4, 3, 5).contiguous()
-    patches = x.view(b, -1, p, p)
-    return patches
-    
-def unpatchify(shape, recon_patches, patch_size=16):
-    b, c, h, w = shape
-    p = patch_size
-    # 5. Reconstruct the image from patches
-    # Shape: [B, C, H//p, W//p, p, p]
-    recon_x = recon_patches.view(b, c, h // p, w // p, p, p)
-    # Move back to [B, C, H, W]
-    recon_x = recon_x.permute(0, 1, 2, 4, 3, 5).contiguous()
-    recon_x = recon_x.view(b, c, h, w)
-    return recon_x
-
-class BinarizeSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        # Forward pass: Binarize the continuous values (0 or 1)
-        return (x > 0.5).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # Backward pass: Pass gradients straight through
-        return grad_output
-
-class LearnableMask(nn.Module):
-    def __init__(self, wm_dim=32):
-        super().__init__()
-        # Initialize continuous logits. 
-        # Start near 0 (logit = 0.0 means sigmoid(0) = 0.5) 
-        # or slightly positive to encourage initial message passing.
-        self.mask_logits = nn.Parameter(torch.ones(1, 1, wm_dim, wm_dim))
-
-    def forward(self):
-        # 1. Constrain to [0, 1] using sigmoid
-        continuous_mask = torch.sigmoid(self.mask_logits)
-        # 2. Binarize with STE
-        binary_mask = BinarizeSTE.apply(continuous_mask)
-        #binary_mask[:, :, 0, 0] = 0
-        return continuous_mask, binary_mask
-
-class MaskPredict(nn.Module):
-    def __init__(self, wm_channels=1, filters=64, wm_dim=32):
-        super().__init__()
-        self.wm_channels = wm_channels
-        self.convs = nn.Sequential(*[
-            ConvBNLeakyRelu(1, filters), 
-            ConvBNLeakyRelu(filters, filters), 
-            ConvBNLeakyRelu(filters, self.wm_channels, stride=2, last_block=True),
-        ])
-
-    def forward(self, x):
-        continuous_mask = torch.sigmoid(self.convs(x[:, 3:, :, :]))
-        binary_mask = (continuous_mask >= 0.5).float()
-        return continuous_mask, binary_mask
-
 class ConvBNLeakyRelu(nn.Module):
     def __init__(self, channels_in, channels_out, stride=1, last_block=False):
         super().__init__()
@@ -341,31 +270,6 @@ class WMModel_FFT(WMModel):
         
         return decoded_msg, recon_noise
 
-def gaussian_kl_divergence(z_T_prime):
-    """
-    Calculates the empirical KL divergence between the distribution of z_T_prime 
-    and a standard normal distribution N(0, I).
-    
-    Args:
-        z_T_prime (Tensor): The reconstructed/watermarked noise latent, shape [B, C, H, W]
-        
-    Returns:
-        Tensor: A scalar loss value representing the average KL divergence.
-    """
-    # 1. Compute empirical mean (\mu) and variance (\sigma^2) across the batch
-    mu = z_T_prime.mean(dim=0)
-    var = z_T_prime.var(dim=0, unbiased=False)
-    
-    # Small epsilon to ensure numerical stability and prevent log(0)
-    eps = 1e-8
-    
-    # 2. Apply the analytical KL divergence formula:
-    # D_KL( N(\mu, \sigma^2) || N(0, 1) ) = 0.5 * ( \sigma^2 + \mu^2 - 1 - log(\sigma^2) )
-    kl_div = 0.5 * (var + mu**2 - 1.0 - torch.log(var + eps))
-    
-    # 3. Average the KL penalty across all channels and spatial dimensions
-    return kl_div.mean()
-
 def slerp(strength, org_latent):
     """
     對整批張量進行球面線性插值 (Batched Spherical Linear Interpolation)。
@@ -477,14 +381,8 @@ def exec_train(args):
             freq_latent_wm = model.embed(noise_latent, message)
 
             if args.strength > 0.0:
-                strength = torch.rand(args.batch_size, 1, device=args.device) * args.strength
-                # 2. Create a mask where 20% of the batch is exactly 0.0 (Unattacked)
-                # p=0.8 means 80% chance of being 1 (attacked), 20% chance of 0 (clean)
-                attack_mask = torch.bernoulli(torch.full((args.batch_size, 1), 0.8, device=args.device))
-                final_strength = strength * attack_mask
-                freq_noise_attacked = model.attack(freq_latent_wm, final_strength)
-                #strength = torch.rand(args.batch_size, 1).to(args.device) * args.strength
-                #freq_noise_attacked = model.attack(freq_latent_wm, strength)
+                strength = torch.rand(args.batch_size, 1).to(args.device) * args.strength
+                freq_noise_attacked = model.attack(freq_latent_wm, strength)
             else:
                 freq_noise_attacked = freq_latent_wm
             
@@ -493,13 +391,11 @@ def exec_train(args):
             # 6. Calculate losses
             wm_loss = bce_loss(decoded_msg, message)
             recon_loss = mse_loss(noise_latent, recon_noise)
-            kl_loss = gaussian_kl_divergence(recon_noise)
-            total_loss = 10.0 * wm_loss + recon_loss + (0.1 * kl_loss)
+            total_loss = 10.0 * wm_loss + recon_loss
             
             train_log['total_loss'].update(total_loss.detach().item())
             train_log['wm_loss'].update(wm_loss.detach().item())
             train_log['recon_loss'].update(recon_loss.detach().item())
-            train_log['kl_loss'].update(kl_loss.detach().item())
             
             bit_error_rate = (decoded_msg.sigmoid().round() != message).float().mean()
             train_log['bit_error_rate'].update(bit_error_rate.detach().item())
@@ -539,100 +435,6 @@ def exec_train(args):
 
         metric_str = ', '.join([f'{m}: {train_log[m].avg:.6f}' for m in train_log])
         logging.info(f"Epoch [{epoch+1}/{args.epochs}] [{best_epoch}] {metric_str}")
-
-def rotate_image(img, degree=5):    
-    # Calculate the center of the image
-    # Note: PIL's rotate uses the center by default if not specified
-    width, height = img.size
-    center_pixel = (width / 2, height / 2)
-    
-    # Rotate the image by 45 degrees (counter-clockwise)
-    # expand=True resizes the canvas so no corners are cropped
-    # fillcolor=(0,0,0) fills the new background with black (you can change this to white etc.)
-    rotated_img = img.rotate(
-        angle=degree, 
-        center=center_pixel, 
-        expand=False, 
-        fillcolor=(0, 0, 0), 
-        resample=Image.BILINEAR
-    )
-
-    return rotated_img
-
-def blur_image(img, radius=2):
-    from PIL import ImageFilter
-    # Apply Gaussian Blur with a specified radius
-    blurred_img = img.filter(ImageFilter.GaussianBlur(radius=radius))
-    return blurred_img
-
-def crop_image(img, crop_ratio_range=(0.1, 0.2)):
-    width, height = img.size
-    
-    # Randomly determine the crop ratio
-    crop_ratio = random.uniform(*crop_ratio_range)
-    
-    # Calculate new dimensions
-    new_width = int(width * (1 - crop_ratio))
-    new_height = int(height * (1 - crop_ratio))
-    
-    # Randomly select the top-left corner for the crop
-    left = random.randint(0, width - new_width)
-    top = random.randint(0, height - new_height)
-    right = left + new_width
-    bottom = top + new_height
-    
-    # Crop and then resize back to original dimensions to maintain consistency
-    cropped_img = img.crop((left, top, right, bottom))
-    # Create a black background image of the original size
-    black_bg = Image.new("RGB", (width, height), (0, 0, 0))
-    # Paste the cropped image onto the black background at the original position
-    black_bg.paste(cropped_img, (left, top))
-    return black_bg
-
-def wipe_image(img):
-    width, height = img.size
-    # Randomly determine the wipe direction (horizontal or vertical)
-    if random.choice(['horizontal', 'vertical']) == 'horizontal':
-        # Wipe a horizontal strip
-        wipe_height = random.randint(height // 10, height // 5)  # Random wipe height between 10% and 20% of image height
-        top = random.randint(0, height - wipe_height)
-        img.paste((0, 0, 0), (0, top, width, top + wipe_height))
-    else:
-        # Wipe a vertical strip
-        wipe_width = random.randint(width // 10, width // 5)  # Random wipe width between 10% and 20% of image width
-        left = random.randint(0, width - wipe_width)
-        img.paste((0, 0, 0), (left, 0, left + wipe_width, height))
-    return img
-
-def inverse_image(image, pipe):
-    if type(image) == str:
-        image = Image.open(image).convert("RGB")
-    raw_tensor = (pil_to_tensor(image) / 255.0).unsqueeze(0).to(device=args.device, dtype=pipe.vae.dtype)
-    image_tensor = 2.0 * raw_tensor - 1.0
-    with torch.no_grad():
-        latents = pipe.vae.encode(image_tensor).latent_dist.mode()
-        # Important: Scale latents by the magic number constant
-        latents = latents * pipe.vae.config.scaling_factor
-    
-        prompt = ""
-        text_input = pipe.tokenizer(prompt, padding="max_length", max_length=pipe.tokenizer.model_max_length, truncation=True, return_tensors="pt")
-        encoder_hidden_states = pipe.text_encoder(text_input.input_ids.to(args.device))[0]
-
-        # Setup the Inverse Scheduler
-        num_inference_steps = 50
-        inverse_scheduler = DDIMInverseScheduler.from_config(pipe.scheduler.config, clip_sample=False)
-        inverse_scheduler.set_timesteps(num_inference_steps, device=args.device)
-
-        print("Starting DDIM Inversion...")
-
-        # C. The Inversion Loop (t: 0 -> 1000)
-        inverted_latents = latents.clone()
-        for t in tqdm(inverse_scheduler.timesteps):
-            # 1. Predict noise
-            noise_pred = pipe.unet(inverted_latents, t, encoder_hidden_states=encoder_hidden_states).sample
-            # 2. Step "backwards" (adding noise deterministically)
-            inverted_latents = inverse_scheduler.step(noise_pred, t, inverted_latents).prev_sample
-    return inverted_latents
 
 def inverse_image_batch(image, pipe):
     batch_size = image.shape[0]
@@ -896,55 +698,6 @@ def exec_variety(args):
             bit_error_rate = (decoded_msg[i:i+1].sigmoid().round() != message[i:i+1]).float().mean().item()
             print(f"{var_name}: mean {m:.6f}, var {v:.6f}, mse {mse:.6f}, bit_error_rate {bit_error_rate:.6f}")
 
-def exec_noise(args):
-    att_pipe = ReSDPipeline.from_pretrained(LDM_MODELS['sd15'], torch_dtype=torch.float16, safety_checker=None, requires_safety_checker=False)
-    att_pipe.set_progress_bar_config(disable=True)
-    att_pipe.to(args.device)
-    
-    attackers = {
-        'cheng2020-anchor_3': VAEWMAttacker('cheng2020-anchor', quality=3, metric='mse', device=args.device),
-        'bmshj2018-factorized_3': VAEWMAttacker('bmshj2018-factorized', quality=3, metric='mse', device=args.device),
-        'diff_attacker_60': DiffWMAttacker(att_pipe, batch_size=5, noise_step=60, captions={}),
-        'jpeg_attacker_50': JPEGAttacker(quality=50),
-        #'rotate_90': RotateAttacker(degree=90),
-        'brightness_0.5': BrightnessAttacker(brightness=0.5),
-        'contrast_0.5': ContrastAttacker(contrast=0.5),
-        'Gaussian_noise': GaussianNoiseAttacker(std=0.1),
-        'Gaussian_blur': GaussianBlurAttacker(kernel_size=5, sigma=2),
-        #'bm3d': BM3DAttacker(),
-    }
-
-    model_id = LDM_MODELS[args.ldm]
-    print(f"Loading Stable Diffusion {model_id}...")
-    pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float32, safety_checker=None, requires_safety_checker=False)
-    pipe.to(args.device)
-
-    fn_base = 'example/input/pepper.tiff'
-
-    inverse_names = [fn_base]
-    md_tags = ['org']
-
-    for atk_name in attackers:
-        edit_name = make_filepath(fn_base, dir_name=args.output, ext_name='png', tag=atk_name)
-        attackers[atk_name].attack([fn_base], [edit_name], multi=True)
-        inverse_names.append(edit_name)
-        md_tags.append(atk_name)
-
-    img_list = []
-    for im_path in inverse_names:
-        img = Image.open(im_path).convert("RGB")
-        img_list.append(to_tensor(img))
-    img_batch = torch.stack(img_list).to(args.device)
-    inverted_latents = inverse_image_batch(img_batch, pipe)
-
-    mse_loss = nn.MSELoss()
-
-    freq_latents = dct.dct_2d(inverted_latents, norm='ortho')
-    print(freq_latents.shape)
-    for i in range(1, freq_latents.shape[0]):
-        error = mse_loss(freq_latents[0, :, :, :], freq_latents[i, :, :, :])
-        print(f'{md_tags[i]}: {error.item():.6f}')
-
 def init_prepare(args):
     args.device = torch.device("cuda" if not args.disable_gpu and torch.cuda.is_available() else "cpu")
     
@@ -981,7 +734,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__file__)
     parser.add_argument('--train', dest='dispatch', action='store_const', const=exec_train, default=None, help='train')
     parser.add_argument('--embed', dest='dispatch', action='store_const', const=exec_embed, help='embed watermark and generate image')
-    parser.add_argument('--noise', dest='dispatch', action='store_const', const=exec_noise, help='')
     parser.add_argument('--var', dest='dispatch', action='store_const', const=exec_variety, help='')
     parser.add_argument('--disable_gpu', action='store_true', help='flag whether to disable GPU')
     parser.add_argument('--name', type=str, default='default', required=False, help='name the training')
